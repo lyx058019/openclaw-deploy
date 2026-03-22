@@ -1,0 +1,1 @@
+../../deploy/remote/remote_deploy.sh

@@ -1,0 +1,1 @@
+../build/full/full_builder.sh

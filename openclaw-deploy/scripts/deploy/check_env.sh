@@ -1,0 +1,1 @@
+../../deploy/local/check_env.sh
