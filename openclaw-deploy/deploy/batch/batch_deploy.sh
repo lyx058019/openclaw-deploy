@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$PROJECT_DIR/deploy/common.sh" 2>/dev/null || source "$PROJECT_DIR/build/common.sh"
 
 INVENTORY_FILE=""
@@ -15,6 +15,7 @@ MODE="cover"
 PARALLEL=1
 MAX_JOBS=4
 DRY_RUN=false
+TEST_MODE=false
 TIMEOUT_SECONDS=300
 
 RED='\033[0;31m'
@@ -37,7 +38,8 @@ usage() {
   --install-dir <dir>    远程安装目录（默认: /opt/openclaw）
   --mode <mode>          冲突处理模式（默认: cover）
   --timeout <seconds>    单台主机超时（默认: 300）
-  --dry-run              模拟运行，不实际部署
+  --dry-run              模拟运行（不实际部署）
+  --test                 仅测试解析逻辑（不连接 SSH）
   -h, --help             显示帮助
 
 示例:
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
     --mode) MODE="$2"; shift 2;;
     --timeout) TIMEOUT_SECONDS="$2"; shift 2;;
     --dry-run) DRY_RUN=true; shift;;
+    --test) TEST_MODE=true; shift;;
     -h|--help) usage; exit 0;;
     *) log_error "未知参数: $1"; usage; exit 1;;
   esac
@@ -77,7 +80,7 @@ if [ -z "$PACKAGE" ]; then
   usage; exit 1
 fi
 
-if [ ! -f "$PACKAGE" ]; then
+if [ ! -f "$PACKAGE" ] && ! $TEST_MODE; then
   log_error "部署包不存在: $PACKAGE"
   exit 1
 fi
@@ -117,15 +120,15 @@ parse_inventory() {
     local host_port="22"
     local host_key=""
 
-    # 解析 ansible_xxx=yyy 形式的内联变量
-    while IFS='=' read -r key value; do
-      case "$key" in
-        ansible_host) host_addr="$value" ;;
-        ansible_user) host_user="$value" ;;
-        ansible_port) host_port="$value" ;;
-        ansible_ssh_private_key_file) host_key="$value" ;;
+    # 提取 ansible_xxx=yyy 形式的内联变量
+    for kv in $host_entry; do
+      case "$kv" in
+        ansible_host=*) host_addr="${kv#ansible_host=}" ;;
+        ansible_user=*) host_user="${kv#ansible_user=}" ;;
+        ansible_port=*) host_port="${kv#ansible_port=}" ;;
+        ansible_ssh_private_key_file=*) host_key="${kv#ansible_ssh_private_key_file=}" ;;
       esac
-    done < <(echo "$host_entry" | grep -oE 'ansible_[a-z_]+=[^ ]+' | tr '=' '\n')
+    done
 
     HOSTS+=("$host_alias|$host_addr|$host_user|$host_port|$host_key|$current_group")
   done < "$INVENTORY_FILE"
@@ -158,6 +161,76 @@ if $DRY_RUN; then
   done
   echo
   log_success "模拟运行完成，共 ${#HOSTS[@]} 台主机"
+  exit 0
+fi
+
+if $TEST_MODE; then
+  log_info "=== 测试模式（仅验证解析逻辑，不连接 SSH）==="
+  echo
+
+  test_pass=0
+  test_fail=0
+
+  # 测试1: 清单文件可读
+  echo "  [TEST 1/4] 主机清单解析..."
+  if [ ${#HOSTS[@]} -gt 0 ]; then
+    echo -e "  ${GREEN}✅ PASS${NC} — 解析到 ${#HOSTS[@]} 台主机"
+    ((test_pass++)) || true
+  else
+    echo -e "  ${RED}❌ FAIL${NC} — 未解析到任何主机"
+    ((test_fail++)) || true
+  fi
+  echo
+
+  # 测试2: 每台主机字段完整
+  echo "  [TEST 2/4] 主机字段完整性..."
+  for entry in "${HOSTS[@]}"; do
+    IFS='|' read -r alias addr user port key group <<< "$entry"
+    ok=true
+    [ -z "$alias" ] && ok=false
+    [ -z "$addr" ] && ok=false
+    [ -z "$user" ] && ok=false
+    if $ok; then
+      echo -e "  ${GREEN}✅${NC} [$group] $alias — addr=$addr user=$user port=$port"
+    else
+      echo -e "  ${RED}❌${NC} 字段缺失: alias='$alias' addr='$addr' user='$user'"
+      ((test_fail++)) || true
+    fi
+  done
+  echo
+
+  # 测试3: 分组统计
+  echo "  [TEST 3/4] 分组统计..."
+  group_summary=$(for entry in "${HOSTS[@]}"; do
+    IFS='|' read -r alias addr user port key group <<< "$entry"
+    echo "$group"
+  done | sort | uniq -c | sort -rn | while read count group; do
+    echo "    $group: $count 台"
+  done)
+  echo "$group_summary"
+  echo -e "  ${GREEN}✅ PASS${NC}"
+  echo
+
+  # 测试4: 部署包存在性（不验证内容）
+  echo "  [TEST 4/4] 部署包存在性..."
+  if [ -f "$PACKAGE" ]; then
+    size=$(du -h "$PACKAGE" | cut -f1)
+    echo -e "  ${GREEN}✅ PASS${NC} — $PACKAGE ($size)"
+  elif [ -z "$PACKAGE" ]; then
+    echo -e "  ${YELLOW}⚠️  SKIP${NC} — 未指定部署包（正常，仅解析测试）"
+  else
+    echo -e "  ${RED}❌ FAIL${NC} — 文件不存在: $PACKAGE"
+    ((test_fail++)) || true
+  fi
+  echo
+
+  echo "=============================================="
+  echo -e "  测试结果: ${GREEN}${test_pass} 通过${NC} / ${RED}${test_fail} 失败${NC}"
+  echo "=============================================="
+
+  if [ $test_fail -gt 0 ]; then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -242,7 +315,7 @@ rm -rf /tmp/openclaw-deploy-tmp "$REMOTE_PKG" "${REMOTE_PKG}.sha256"
 echo "✅ 部署完成"
 REMOTE
 
-    local end_time end_time=$(date +%s)
+    local end_time; end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
     echo "=== 结束: $alias (耗时 ${duration}s) [$(date)] ==="
@@ -266,7 +339,6 @@ done
 echo
 
 # 统计
-declare -A group_stats
 total=${#HOSTS[@]}
 succeed=0
 failed=0
@@ -279,7 +351,7 @@ start_ts=$(date +%s)
 if command -v GNU_PARALLEL_ARG:=$(command -v parallel) 2>/dev/null && [ -n "$(command -v parallel)" ]; then
   # 使用 GNU parallel 并行
   printf '%s\n' "${HOSTS[@]}" | parallel -j "$PARALLEL" --colsep '|' \
-    "bash -c 'source $PROJECT_DIR/deploy/batch/batch_deploy.sh --help >/dev/null 2>&1; entry={1}; deploy_one_host \"\$entry\"' _ {}
+    "bash -c 'source $PROJECT_DIR/deploy/batch/batch_deploy.sh --help >/dev/null 2>&1; entry={1}; deploy_one_host \"\$entry\"' _ {}"
 else
   # 降级为 bash 后台任务
   declare -a pids=()
